@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: claims
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d claims"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      kafka:
+        image: apache/kafka:3.9.0
+        ports:
+          - 9092:9092
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 12
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Unit tests (no services needed)
+        run: pytest tests --ignore=tests/integration -q
+
+      - name: Integration tests (PostgreSQL + Kafka)
+        env:
+          PG_DSN: postgresql://postgres:postgres@localhost:5432/claims
+          KAFKA_BOOTSTRAP: localhost:9092
+        run: pytest tests/integration -v -rs
+
+      - name: Demo run
+        env:
+          PG_DSN: postgresql://postgres:postgres@localhost:5432/claims
+          KAFKA_BOOTSTRAP: localhost:9092
+        run: |
+          python -m claims_stream.simulate --claims 200 --replay
+          python -m claims_stream.admin
+          python -m claims_stream.producer --claims 300
+          python -m claims_stream.lag
+          python -m claims_stream.consumer --idle-exit 15
+          python -m claims_stream.lag --rate 500
