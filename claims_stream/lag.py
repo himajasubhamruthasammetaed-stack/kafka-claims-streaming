@@ -15,11 +15,20 @@ Run:  python -m claims_stream.lag [--rate 250]
 from __future__ import annotations
 
 import argparse
+import time
 from dataclasses import dataclass
 
-from confluent_kafka import Consumer, TopicPartition
+from confluent_kafka import Consumer, KafkaError, KafkaException, TopicPartition
 
 from .config import Settings, settings
+
+
+# Temporary errors while the group coordinator is being found or loaded.
+COORDINATOR_ERRORS = {
+    KafkaError.NOT_COORDINATOR,
+    KafkaError.COORDINATOR_LOAD_IN_PROGRESS,
+    KafkaError.COORDINATOR_NOT_AVAILABLE,
+}
 
 
 @dataclass(frozen=True)
@@ -43,13 +52,30 @@ def drain_seconds(total_lag: int, records_per_second: float) -> float | None:
     return total_lag / records_per_second
 
 
+def _committed(client: Consumer, partitions: list[TopicPartition], timeout: float, attempts: int = 10):
+    """client.committed(), retrying errors Kafka marks as retriable.
+
+    On a fresh broker the first offset lookup can fail with NOT_COORDINATOR or
+    COORDINATOR_LOAD_IN_PROGRESS while the internal __consumer_offsets topic is
+    still being created. Those are temporary, so wait and ask again.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            return client.committed(partitions, timeout=timeout)
+        except KafkaException as exc:
+            err = exc.args[0]
+            if attempt == attempts or not (err.retriable() or err.code() in COORDINATOR_ERRORS):
+                raise
+            time.sleep(min(2.0, 0.25 * attempt))
+
+
 def group_lag(cfg: Settings, timeout: float = 10.0) -> list[PartitionLag]:
     # A Consumer that never subscribes doesn't join the group, so this is read-only.
     client = Consumer({"bootstrap.servers": cfg.bootstrap, "group.id": cfg.group_id, "enable.auto.commit": False})
     try:
         metadata = client.list_topics(cfg.topic, timeout=timeout)
         partitions = sorted(metadata.topics[cfg.topic].partitions)
-        committed = client.committed([TopicPartition(cfg.topic, p) for p in partitions], timeout=timeout)
+        committed = _committed(client, [TopicPartition(cfg.topic, p) for p in partitions], timeout)
         result = []
         for tp in committed:
             low, high = client.get_watermark_offsets(TopicPartition(cfg.topic, tp.partition), timeout=timeout)
